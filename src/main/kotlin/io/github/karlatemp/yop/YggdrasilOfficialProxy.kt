@@ -24,7 +24,7 @@ import io.ktor.response.*
 import io.ktor.routing.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
-import io.ktor.util.KtorExperimentalAPI
+import io.ktor.util.*
 import io.ktor.util.pipeline.*
 import io.ktor.utils.io.*
 import io.netty.channel.epoll.Epoll
@@ -83,6 +83,19 @@ object YggdrasilOfficialProxy {
                 append("mojang.com")
             }
             append("/profiles/minecraft")
+        }
+    }
+
+    val profilesSessionServer by lazy {
+        buildString { // Skip AuthLib Injector
+            if (CDN_enable) {
+                append(CDN_origin_link)
+                append("/sessionserver")
+            } else {
+                append("https://sessionserver.")
+                append("mojang.com")
+            }
+            append("/session/minecraft/profile/")
         }
     }
 
@@ -457,6 +470,80 @@ object YggdrasilOfficialProxy {
                             }
                         }
                     }
+
+                    getCatching("/sessionserver/session/minecraft/profile/{uuid}") get@{
+                        val uuid = this.call.parameters["uuid"]
+                        val boolUnsigned = this.call.parameters["unsigned"]
+                        val fromOfficial = async(Dispatchers.IO) {
+                            runCatching {
+                                WrappedLogger.trace("Connecting to official...")
+                                val response = officialClient.get<HttpResponse>(
+                                    url = URLBuilder().apply {
+                                        takeFrom(buildString {
+                                            append(profilesSessionServer)
+                                            append(uuid)
+                                        })
+                                        if(!boolUnsigned.isNullOrEmpty()) {
+                                            parameters.append("unsigned", boolUnsigned.toString())
+                                        }
+                                    }.build()
+                                )
+                                if (response.status.value == 200) {
+                                    WrappedLogger.trace("Official Responsed...")
+                                    return@async response
+                                }
+                            }.onFailure { WrappedLogger.trace("Official NetWork error", t = it) }
+                            return@async null
+                        }
+                        val fromYggdrasil = async(Dispatchers.IO) {
+                            WrappedLogger.trace("Connecting to Yggdrasil...")
+                            runCatching {
+                                val response = yggdrasilClient.get<HttpResponse>(
+                                    url = URLBuilder().apply {
+                                        takeFrom("$baseAPI/sessionserver/session/minecraft/profile/$uuid")
+                                        if(!boolUnsigned.isNullOrEmpty()) {
+                                            parameters.append("unsigned", boolUnsigned.toString())
+                                        }
+                                    }.build().also {
+                                        WrappedLogger.trace("Trying to connect $it")
+                                    }
+                                )
+                                if (response.status.value == 200) {
+                                    WrappedLogger.trace("Yggdrasil Responsed...")
+                                    return@async response
+                                }
+                            }.onFailure { WrappedLogger.trace("Yggdrasil", t = it) }
+                            return@async null
+                        }
+                        val officialResponse = fromOfficial.await()
+                        val yggdrasilResponse = fromYggdrasil.await()
+
+                        val resp = if ((officialResponse ?: yggdrasilResponse) == null) {
+                            // Failed...
+                            WrappedLogger.trace("No server compiled......")
+                            NoContextResponse
+                        } else {
+                            if(officialFirst) {
+                                officialResponse ?: yggdrasilResponse!!
+                            } else {
+                                yggdrasilResponse ?: officialResponse!!
+                            }
+                        }
+                        val resp0 = patch(resp, resp === officialResponse)
+
+                        WrappedLogger.trace("You, and Me.... Finished.")
+                        this.call.respond(object : OutgoingContent.ByteArrayContent() {
+                            override fun bytes(): ByteArray {
+                                return resp0
+                            }
+
+                            override val status: HttpStatusCode
+                                get() = resp.status
+                            override val contentType: ContentType
+                                get() = ContentType("application", "json; charset=utf8")
+                        })
+                    }
+
                     getCatching("/sessionserver/session/minecraft/hasJoined") get@{
                         val user = this.call.parameters["username"]
                         val server = this.call.parameters["serverId"]
